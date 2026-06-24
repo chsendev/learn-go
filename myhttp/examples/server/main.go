@@ -3,6 +3,7 @@ package main
 import (
 	"learn/myhttp"
 	"log"
+	"net"
 )
 
 //type myHandler struct {
@@ -16,10 +17,16 @@ import (
 func main() {
 	s := myhttp.NewHttpServer(":9090", nil)
 
-	myhttp.HandleFunc("/a", func(writer myhttp.ResponseWriter, request *myhttp.Request) {
+	a := myhttp.HandlerFunc(func(writer myhttp.ResponseWriter, request *myhttp.Request) {
 		log.Println(request)
 		writer.Write([]byte("/a ok"))
 	})
+
+	s.ConnState = func(conn net.Conn, state myhttp.ConnState) {
+		log.Printf("连接 %s → %d", conn.RemoteAddr(), state)
+	}
+
+	myhttp.Handle("/a", myhttp.Chain(a, myhttp.Logging, myhttp.Recover))
 
 	myhttp.HandleFunc("/b", func(writer myhttp.ResponseWriter, request *myhttp.Request) {
 		log.Println(request)

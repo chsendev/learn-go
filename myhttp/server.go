@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +22,10 @@ type HttpServer struct {
 	ReadTimeout       time.Duration // 读完整个请求（含 body）的超时，从请求开始计时
 	WriteTimeout      time.Duration // 写响应的超时
 	IdleTimeout       time.Duration // keep-alive 空闲等待下一个请求的超时
+
+	ConnState    func(net.Conn, ConnState)
+	listeners    map[net.Listener]struct{}
+	shuttingDown atomic.Bool
 }
 
 func NewHttpServer(address string, handler Handler) *HttpServer {
@@ -38,22 +43,40 @@ func HandleFunc(pattern string, fn HandlerFunc) {
 	defaultServeMux.HandleFunc(pattern, fn)
 }
 
+func (s *HttpServer) Shutdown() {
+	for listener, _ := range s.listeners {
+		listener.Close()
+	}
+	s.shuttingDown.Store(true)
+}
+
 func (s *HttpServer) ListenAndServe() {
 	ln, err := net.Listen("tcp", s.address)
 	if err != nil {
 		log.Fatal(err)
 	}
+	s.listeners[ln] = struct{}{}
 
 	defer ln.Close()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if s.shuttingDown.Load() {
+				log.Println(err, "shutting down")
+				return
+			}
 			log.Println(err)
 			continue
 		}
 		log.Println("新连接:", conn.RemoteAddr())
 		go serveConn(s, conn)
+	}
+}
+
+func (s *HttpServer) onConnState(conn net.Conn, state ConnState) {
+	if s.ConnState != nil {
+		s.ConnState(conn, state)
 	}
 }
 
@@ -158,14 +181,28 @@ func (h HandlerFunc) ServeHTTP(write ResponseWriter, req *Request) {
 	h(write, req)
 }
 
+type ConnState int
+
+const (
+	StateNew ConnState = iota
+	StateActivate
+	StateIdle
+	StateClosed
+)
+
 func serveConn(s *HttpServer, conn net.Conn) {
 	defer recoverTool()
 	defer conn.Close()
+
+	defer s.onConnState(conn, StateClosed)
+
+	s.onConnState(conn, StateNew)
 
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
 
 	for {
+		s.onConnState(conn, StateIdle)
 		// ─── 阶段 0：IdleTimeout，等下一个请求的第一个字节 ───
 		// 用 Peek(1) 阻塞等数据到来，同时能感知对端关闭。
 		if s.IdleTimeout > 0 {
@@ -175,8 +212,10 @@ func serveConn(s *HttpServer, conn net.Conn) {
 		}
 		if _, err := r.Peek(1); err != nil {
 			// 空闲超时 / 对端关闭 / EOF，都从这里退出（属于正常路径）
+			log.Println("空闲超时 / 对端关闭 / EOF")
 			return
 		}
+		s.onConnState(conn, StateActivate)
 
 		// 客户端开始发请求了，记录请求起始时间，
 		// 后面 ReadHeaderTimeout 和 ReadTimeout 都从这里计算。
@@ -343,4 +382,38 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 
 func (mux *ServeMux) HandleFunc(pattern string, fn HandlerFunc) {
 	mux.m[strings.TrimRight(pattern, "/")] = fn
+}
+
+type Middleware func(Handler) Handler
+
+func Logging(next Handler) Handler {
+	return HandlerFunc(func(writer ResponseWriter, req *Request) {
+		start := time.Now()
+
+		next.ServeHTTP(writer, req)
+
+		log.Printf("%s %s (%v)",
+			req.Method, req.Path, time.Since(start))
+	})
+}
+
+// Recover 中间件：防止 handler panic 拖垮连接
+func Recover(next Handler) Handler {
+	return HandlerFunc(func(w ResponseWriter, req *Request) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("panic recovered: %v", r)
+				w.WriteHeader(500)
+				w.Write([]byte("Internal Server Error"))
+			}
+		}()
+		next.ServeHTTP(w, req)
+	})
+}
+
+func Chain(h Handler, mws ...Middleware) Handler {
+	for i := len(mws) - 1; i >= 0; i-- {
+		h = mws[i](h)
+	}
+	return h
 }

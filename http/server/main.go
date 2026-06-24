@@ -56,6 +56,7 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
+	srv.Shutdown()
 }
 
 // helloHandler 返回一段纯文本。
