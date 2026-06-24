@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"learn/myhttp"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"time"
 )
 
 //type myHandler struct {
@@ -33,5 +37,22 @@ func main() {
 		writer.Write([]byte("/b ok"))
 	})
 
-	s.ListenAndServe()
+	// 启动服务
+	go func() {
+		s.ListenAndServe()
+	}()
+
+	// 监听退出信号
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+
+	log.Println("开始优雅关机...")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := s.Shutdown(ctx); err != nil {
+		log.Println("强制退出:", err)
+	}
+	log.Println("干净退出")
 }

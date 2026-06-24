@@ -3,12 +3,14 @@ package myhttp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -23,9 +25,12 @@ type HttpServer struct {
 	WriteTimeout      time.Duration // 写响应的超时
 	IdleTimeout       time.Duration // keep-alive 空闲等待下一个请求的超时
 
-	ConnState    func(net.Conn, ConnState)
-	listeners    map[net.Listener]struct{}
-	shuttingDown atomic.Bool
+	ConnState func(net.Conn, ConnState)
+
+	inShutdown atomic.Bool
+	listener   net.Listener
+	mu         sync.Mutex
+	connState  map[net.Conn]ConnState // 跟踪每个连接的状态
 }
 
 func NewHttpServer(address string, handler Handler) *HttpServer {
@@ -43,31 +48,76 @@ func HandleFunc(pattern string, fn HandlerFunc) {
 	defaultServeMux.HandleFunc(pattern, fn)
 }
 
-func (s *HttpServer) Shutdown() {
-	for listener, _ := range s.listeners {
-		listener.Close()
+func (s *HttpServer) Shutdown(ctx context.Context) error {
+	s.inShutdown.Store(true)
+
+	// ① 关 listener，不再接受新连接
+	if s.listener != nil {
+		s.listener.Close()
 	}
-	s.shuttingDown.Store(true)
+
+	// ② 轮询等待所有连接退出（模仿 net/http）
+	pollInterval := time.Millisecond
+	timer := time.NewTimer(pollInterval)
+	defer timer.Stop()
+
+	for {
+		if s.closeIdleConns() {
+			return nil // 所有连接都优雅退出了
+		}
+		select {
+		case <-ctx.Done():
+			// 超时：只返回 error，不强制关闭活跃连接（模仿 net/http）
+			s.mu.Lock()
+			active := len(s.connState)
+			s.mu.Unlock()
+			log.Printf("Shutdown timeout, %d connections still active", active)
+			return ctx.Err()
+		case <-timer.C:
+			// 指数退避
+			pollInterval *= 2
+			if pollInterval > 500*time.Millisecond {
+				pollInterval = 500 * time.Millisecond
+			}
+			timer.Reset(pollInterval)
+		}
+	}
 }
 
-func (s *HttpServer) ListenAndServe() {
+// closeIdleConns 关闭所有空闲连接，返回 true 表示所有连接都已退出
+func (s *HttpServer) closeIdleConns() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 关闭所有空闲连接
+	for conn, state := range s.connState {
+		if state == StateIdle {
+			conn.Close()
+			delete(s.connState, conn)
+		}
+	}
+
+	// 返回 true 表示没有连接了
+	return len(s.connState) == 0
+}
+
+func (s *HttpServer) ListenAndServe() error {
 	ln, err := net.Listen("tcp", s.address)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	s.listeners[ln] = struct{}{}
+	s.listener = ln
+	s.connState = make(map[net.Conn]ConnState)
 
 	defer ln.Close()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if s.shuttingDown.Load() {
-				log.Println(err, "shutting down")
-				return
+			if s.inShutdown.Load() {
+				return nil // 关机导致的关闭，不算错误
 			}
-			log.Println(err)
-			continue
+			return err
 		}
 		log.Println("新连接:", conn.RemoteAddr())
 		go serveConn(s, conn)
@@ -194,15 +244,22 @@ func serveConn(s *HttpServer, conn net.Conn) {
 	defer recoverTool()
 	defer conn.Close()
 
+	s.trackConn(conn, StateNew)
+	defer s.untrackConn(conn)
 	defer s.onConnState(conn, StateClosed)
 
 	s.onConnState(conn, StateNew)
-
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
 
 	for {
+		s.setState(conn, StateIdle)
 		s.onConnState(conn, StateIdle)
+
+		if s.inShutdown.Load() {
+			return
+		}
+
 		// ─── 阶段 0：IdleTimeout，等下一个请求的第一个字节 ───
 		// 用 Peek(1) 阻塞等数据到来，同时能感知对端关闭。
 		if s.IdleTimeout > 0 {
@@ -215,6 +272,7 @@ func serveConn(s *HttpServer, conn net.Conn) {
 			log.Println("空闲超时 / 对端关闭 / EOF")
 			return
 		}
+		s.setState(conn, StateActivate)
 		s.onConnState(conn, StateActivate)
 
 		// 客户端开始发请求了，记录请求起始时间，
@@ -271,6 +329,26 @@ func serveConn(s *HttpServer, conn net.Conn) {
 		if shouldClose(req) {
 			break
 		}
+	}
+}
+
+func (s *HttpServer) trackConn(conn net.Conn, state ConnState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.connState[conn] = state
+}
+
+func (s *HttpServer) untrackConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.connState, conn)
+}
+
+func (s *HttpServer) setState(conn net.Conn, state ConnState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.connState[conn]; ok {
+		s.connState[conn] = state
 	}
 }
 
