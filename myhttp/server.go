@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -145,6 +146,46 @@ type Request struct {
 	Proto  string
 	Header map[string][]string
 	Body   io.Reader
+
+	// ─── M10 客户端侧新增字段 ─────────────────────────────────────
+	// 这些字段服务端读请求时用不到，仅在客户端构造请求时填充。
+	// 之所以放这里而不是另起类型，是为了贴近 net/http：标准库的
+	// Request 同时承担"服务端解析出来的"和"客户端要发出去的"两种角色。
+
+	URL  *url.URL // 客户端请求的目标 URL（含 scheme/host/path/query）
+	Host string   // 写到报文里的 Host 头；默认取 URL.Host
+	// Close=true 时报文会带 "Connection: close"，且响应读完后连接不放回池子
+	Close bool
+
+	// ─── M11 取消 / 超时 / 重试 ───────────────────────────────────
+	// ctx 是请求级 context。零值时按 context.Background() 处理。
+	// 取消 / 超时都通过它传播：Transport.roundTrip 的 select 会盯着 ctx.Done()。
+	ctx context.Context
+
+	// GetBody 用于在安全重试时重新生成一份 body。
+	// 由 newRequest 在能识别 body 类型（*bytes.Reader、*strings.Reader、*bytes.Buffer、nil）时自动填好。
+	// 用户自己构造 Request 时如果不填，则该请求不可重试（保守策略，避免 body 被部分消费后无法回放）。
+	GetBody func() (io.ReadCloser, error)
+}
+
+// Context 返回请求绑定的 context。nil 时返回 context.Background()。
+func (r *Request) Context() context.Context {
+	if r.ctx != nil {
+		return r.ctx
+	}
+	return context.Background()
+}
+
+// WithContext 返回 r 的浅拷贝，绑定新的 ctx。
+// 与 net/http 一样：原 Request 不被修改，便于在调用链里"派生"。
+func (r *Request) WithContext(ctx context.Context) *Request {
+	if ctx == nil {
+		panic("nil ctx")
+	}
+	r2 := new(Request)
+	*r2 = *r
+	r2.ctx = ctx
+	return r2
 }
 
 type Header map[string][]string
